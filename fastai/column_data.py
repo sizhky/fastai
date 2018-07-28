@@ -184,10 +184,15 @@ class CollabFilterDataset(Dataset):
         val, trn = zip(*split_by_idx(val_idxs, *self.cols))
         return ColumnarModelData(self.path, PassthruDataset(*trn), PassthruDataset(*val), bs)
 
-    def get_model(self, n_factors):
+    def get_old_model(self, n_factors):
         model = EmbeddingDotBias(n_factors, self.n_users, self.n_items, self.min_score, self.max_score)
         return CollabFilterModel(to_gpu(model))
 
+    def get_model(self, n_factors, nh:'int or list'=10, ps:'including input dropout'=[0.05, 0.5]):
+        model = CollabFilter(n_factors, self.n_users, self.n_items, self.min_score, self.max_score,
+                             nh, ps)
+        return CollabFilterModel(to_gpu(model))
+        
     def get_learner(self, n_factors, val_idxs, bs, **kwargs):
         return CollabFilterLearner(self.get_data(val_idxs, bs), self.get_model(n_factors), **kwargs)
 
@@ -210,6 +215,26 @@ class EmbeddingDotBias(nn.Module):
         um = self.u(users)* self.i(items)
         res = um.sum(1) + self.ub(users).squeeze() + self.ib(items).squeeze()
         return F.sigmoid(res) * (self.max_score-self.min_score) + self.min_score
+    
+class CollabFilter(nn.Module):
+    def __init__(self, n_factors, n_users, n_movies, max_score, min_score, nh, ps):
+        super().__init__()
+        (self.u, self.m) = [get_emb(*o) for o in [
+            (n_users, n_factors), (n_movies, n_factors)]]
+        if isinstance(nh, int): nh = [nh]
+        if isinstance(ps, float): ps = [ps]
+        n_acts = [n_factors*2, *nh, 1]
+        self.lins = nn.ModuleList(nn.Linear(n_acts[idx], n_acts[idx+1]) for idx in range(len(n_acts)-1))
+        self.drops = nn.ModuleList(nn.Dropout(p) for p in ps)
+        assert len(self.lins) == len(self.drops), f'Number of linear layers {self.lins} is not the same as number of dropouts f{self.drops}'
+
+    def forward(self, users, items):
+        users,movies = cats[:,0],cats[:,1]
+        x = self.drops[0](torch.cat([self.u(users),self.m(movies)], dim=1))
+        for idx in range(len(self.lins)-1):
+            x = self.drops[idx+1](F.relu(self.lins[idx](x)))
+        x = self.lins[-1](x)
+        return F.sigmoid(x) * (self.max_score-self.min_score) + self.min_score
 
 
 class CollabFilterLearner(Learner):
